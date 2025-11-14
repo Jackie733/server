@@ -8,14 +8,19 @@ import type {
   TCPConn,
   DynBuf,
   BufferGenerator,
+  HTTPRange,
 } from "./types.ts";
 
 /* UTILITIES */
 
 async function* countSheep(): BufferGenerator {
-  for (let i = 0; i < 100; i++) {
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-    yield Buffer.from(`${i}\n`);
+  try {
+    for (let i = 0; i < 100; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      yield Buffer.from(`${i}\n`);
+    }
+  } finally {
+    console.log("cleanup");
   }
 }
 
@@ -233,6 +238,54 @@ function fieldGet(headers: Buffer[], key: string): null | Buffer {
   return null;
 }
 
+function parseBytesRanges(r: null | Buffer): HTTPRange[] {
+  if (!r) {
+    return [];
+  }
+
+  const rangeHeader = r.toString("latin1").trim();
+  if (!rangeHeader.startsWith("bytes=")) {
+    throw new HTTPError(400, "Invalid Range header");
+  }
+
+  const rangeSet = rangeHeader.slice(6); // remove 'bytes='
+  const trimmedSpec = rangeSet.trim();
+  if (trimmedSpec === "") {
+    return [];
+  }
+  // '-suffix-length'
+  if (trimmedSpec.startsWith("-")) {
+    const suffixLength = parseInt(trimmedSpec.slice(1), 10);
+    if (isNaN(suffixLength) || suffixLength < 0) {
+      throw new HTTPError(400, "Invalid suffix-range format");
+    }
+    return [suffixLength];
+  }
+
+  // int-range: 'first-pos-[ last-pos ]'
+  const dashIndex = trimmedSpec.indexOf("-");
+  if (dashIndex === -1) {
+    throw new HTTPError(400, "Invalid range-spec format");
+  }
+  const firstPosStr = trimmedSpec.slice(0, dashIndex);
+  const lastPosStr = trimmedSpec.slice(dashIndex + 1);
+
+  const firstPos = parseInt(firstPosStr, 10);
+  if (isNaN(firstPos) || firstPos < 0) {
+    throw new HTTPError(400, "Invalid first-pos in range");
+  }
+
+  let lastPos: number | null = null;
+  if (lastPosStr !== "") {
+    lastPos = parseInt(lastPosStr, 10);
+    if (isNaN(lastPos) || lastPos < 0) {
+      throw new HTTPError(400, "Invalid last-pos in range");
+    }
+  }
+
+  return [[firstPos, lastPos]];
+}
+
 // decode the chunked encoding and yield the data on the fly
 async function* readChunks(conn: TCPConn, buf: DynBuf): BufferGenerator {
   for (let last = false; !last; ) {
@@ -323,22 +376,21 @@ function readerFromGenerator(gen: BufferGenerator): BodyReader {
         return r.value;
       }
     },
+    close: async (): Promise<void> => {
+      // force it `return` so that the generator functions using `finally` can execute
+      await gen.return();
+    },
   };
 }
 
+// TODO: resuing large buffers
 function readerFromStaticFile(fp: fs.FileHandle, size: number): BodyReader {
-  let got = 0; // bytes read so far
+  const buf = Buffer.allocUnsafe(65536);
   return {
     length: size,
     read: async (): Promise<Buffer> => {
-      const r: fs.FileReadResult<Buffer> = await fp.read();
-      got += r.bytesRead;
-      if (got > size || (got < size && r.bytesRead === 0)) {
-        // unhappy case: file size changed.
-        // cannot continue since we have sent the 'Content-Length'
-        throw new Error("file size changed, abandon it!");
-      }
-      // NOTE: the automatically allocated buffer may be larger
+      const r = await fp.read({ buffer: buf });
+      // CAUTION: the lifetime of the buffer is unclear
       return r.buffer.subarray(0, r.bytesRead);
     },
     close: async () => await fp.close(),
@@ -354,13 +406,13 @@ async function serveStaticFile(path: string): Promise<HTTPRes> {
       return respError(404, "Not a file");
     }
     const size = stat.size;
+    // the ownership is transferred to the reader
     const reader: BodyReader = readerFromStaticFile(fp, size);
-    fp = null;
     return { code: 200, headers: [], body: reader };
   } catch (error) {
     return respError(400, "Not Found");
   } finally {
-    await fp?.close();
+    fp = null;
   }
 }
 

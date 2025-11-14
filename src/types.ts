@@ -13,6 +13,13 @@ export type HTTPRes = {
   body: BodyReader;
 };
 
+// range-spec   = int-range
+//              / sufffix-range
+//              / other-range
+// int-range    = first-pos "-" [ last-pos ]
+// suffix-range = "-" suffix-length
+export type HTTPRange = [number, number | null] | number;
+
 export type BodyReader = {
   // the 'Content-Length', -1 if unknown.
   length: number;
